@@ -1,0 +1,465 @@
+#!/bin/sh
+#Author: Emmanuel Toko
+#/etc/init.d/vm-manager
+#
+### BEGIN INIT INFO
+# Provides:          vm_mgmt
+# Required-Start:    $network $remote_fs $VBoxManage $VBoxHeadless $syslog
+# Required-Stop:     $network $remote_fs $VBoxManage $VBoxHeadless $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Start VMs in headless mode.
+# Description:       Run VMs for the default VirtualBox user in
+#                    headless mode. Make sure all VMs are using different RDP
+#                    ports.
+### END INIT INFO
+
+VM_USER=ehealth
+
+# The list of VMs to run. Leave empty to run all registered VMs.
+VM_LIST=""
+
+# VirtualBox executables
+VM_MANAGE=/usr/bin/VBoxManage
+VM_HEADLESS=/usr/bin/VBoxHeadless
+
+# Do NOT "set -e"
+
+# PATH should only include /usr/* if it runs after the mountnfs.sh script
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="VirtualBox daemon"
+NAME=vm-manager
+DAEMON=$VM_HEADLESS
+DAEMON_ARGS=""
+PIDFILE=/var/run/$NAME.pid
+#SCRIPTNAME=/etc/init.d/$NAME
+SCRIPTNAME=/etc/init.d/$NAME
+BATTERY_THRESHOLD=3
+# Exit if the package is not installed
+[ -x "$DAEMON" ] || exit 0
+
+# Read configuration variable file if it is present
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+# Load the VERBOSE setting and other rcS variables
+. /lib/init/vars.sh
+
+# LSB log_* functions.
+. /lib/lsb/init-functions
+
+vm_init_list()
+{
+	CHECK_VM_TYPE=0
+	LIST_VMS=""
+	 # get registered VMs
+	 
+	 if [ "$CHECK_VM_TYPE" -eq "$1" ]
+	 then
+	 	 LIST_VMS=`sudo -H -u $VM_USER $VM_MANAGE --nologo list vms | cut -d ' ' -f 1 | tr -d '"'`
+	 else
+	 	 LIST_VMS=`sudo -H -u $VM_USER $VM_MANAGE --nologo list runningvms | cut -d ' ' -f 1 | tr -d '"'`
+	 fi
+	
+	VM_LIST=$LIST_VMS
+}
+
+# get uuid for vm
+vm_get_uuid()
+{
+   vm=$1
+   hwuuid=`sudo -H -u $VM_USER $VM_MANAGE --nologo showvminfo --machinereadable "$vm" | grep 'hardwareuuid='`
+   echo $hwuuid | cut -d '=' -f 2 | tr -d '"'
+}
+
+# control running vm
+vm_ctrl()
+{
+   sudo -H -u $VM_USER $VM_MANAGE --nologo controlvm $1 $2 > /dev/null 2>&1
+}
+
+#
+# Function that starts the daemon/service
+#
+do_start()
+{
+	#First do a check on the amount of battery that the system has at this point
+	BATTERY_LEVEL=0
+	
+	#acpi outputs battery info like so: Battery 0: Discharging, 93%, 07:07:03 remaining
+	BATTERY_LEVEL=`acpi | awk '{print $4}' | tr -d "%,"`
+	
+	if [ "$BATTERY_LEVEL" -le "$BATTERY_THRESHOLD" ]
+	then
+		log_failure_msg ":( The battery level is low [$BATTERY_LEVEL%] so halting...."
+		exit 1
+	fi
+	
+	vm_init_list 0
+	
+	# Return
+	#   0 if daemon has been started
+	#   1 if daemon was already running
+	#   2 if daemon could not be started
+	RETVAL=0
+	
+	VM_EXISTS=0
+	FALSE=0
+	TRUE=1
+	
+	#Internal function that will "safely" a VM or VMS. Function takes one.. 
+	#argument i.e. the VM name and attempts to start that VM
+	start_vm()
+	{
+		VM=$1
+		VM_UUID=`vm_get_uuid $VM`
+		VM_PIDFILE="$PIDFILE.$VM_UUID"
+		VM_DAEMON="$DAEMON"
+		VM_DAEMON_ARGS="$DAEMON_ARGS --startvm $VM_UUID"
+		  
+		log_action_begin_msg "Starting VM '$1'"
+		  
+		# test for running VM
+		USER=$VM_USER LOGNAME=$VM_USER start-stop-daemon \
+			--start \
+			--quiet \
+			--pidfile $VM_PIDFILE \
+			--startas $VM_DAEMON \
+			--test \
+			> /dev/null
+		  
+		# VM already running
+		if [ "$?" != 0 ]
+		then
+			# report VM is running
+			log_warning_msg "VM '$1' already running"
+			[ "$RETVAL" = 0 ] && RETVAL=1
+			continue
+		fi
+	  
+		# start VM
+		USER=$VM_USER LOGNAME=$VM_USER start-stop-daemon \
+		 --start \
+		 --quiet \
+		 --pidfile $VM_PIDFILE \
+		 --make-pidfile \
+		 --background \
+		 --chuid $VM_USER \
+		 --startas $VM_DAEMON \
+		 -- $VM_DAEMON_ARGS
+		  
+	 log_action_end_msg "$?"
+		  
+	 # check if start failed
+	 if [ "$?" != 0 ]
+	 then
+	 	 # report error
+	 	 log_failure_msg "Error starting VM '$VM' :("
+	 	 RETVAL=2
+	 fi
+	  
+	 RETVAL="$?"
+			
+	 log_action_end_msg "$RETVAL"
+	exit 0
+	}
+	
+	if [ -n "$1" ]
+	then
+		for VM in $VM_LIST
+		do
+			if [ "$VM" = "$1" ]
+			then
+				VM_EXISTS=1
+			fi
+		done
+		
+		if [ "$VM_EXISTS" -eq "$TRUE" ]
+		then
+			start_vm $1	
+		else
+			log_failure_msg "VM '$1' is not a registered VM"
+			echo "Enter one VM name from the list below[VM names are case sensitive];"
+			
+			for VM_1 in $VM_LIST
+			do
+				echo "$VM_1"
+			done
+			exit 1
+		fi
+		
+		VM_EXISTS=0
+		
+		return
+	fi
+   
+	# Start all VMs
+	for VM in $VM_LIST
+	do
+      	start_vm $VM
+	done
+   
+   if [ "$RETVAL" -lt 2 ]
+   then
+      log_daemon_msg "VirtualBox daemon started successfully"
+   else
+      log_daemon_msg "VirtualBox daemon started with errors"
+   fi
+   
+
+   
+   return "$RETVAL"
+}
+
+#
+# Function that stops the daemon/service
+#
+do_stop()
+{
+   vm_init_list 1
+   
+   # Return
+   #   0 if daemon has been stopped
+   #   1 if daemon was already stopped
+   #   2 if daemon could not be stopped
+   #   other if a failure occurred
+   RETVAL=0
+	VM_EXISTS=0
+	FALSE=0
+	TRUE=1
+	
+   #Function "safely" stops and running VM instance. Call this function in a 
+   #loop to stop all running VM instances (Not the best way but still good)
+   stop_vm()
+   {
+   	   VM=$1
+   	   VM_UUID=`vm_get_uuid $VM`
+   	   VM_PIDFILE="$PIDFILE.$VM_UUID"
+      
+   	   log_action_begin_msg "Stopping VM '$VM'"
+      
+   	   # try savestate halt
+   	   vm_ctrl $VM poweroff
+      
+   	   # stop daemon
+      USER=$VM_USER LOGNAME=$VM_USER start-stop-daemon \
+         --stop \
+         --quiet \
+         --retry=TERM/30/KILL/5 \
+         --pidfile $VM_PIDFILE
+      
+      case "$?" in
+      0)
+         log_action_end_msg 0
+         ;;
+      1)
+         log_warning_msg "VM '$VM' already stopped"
+         [ "$RETVAL" = 0 ] && RETVAL=1
+         ;;
+      2)
+         log_action_end_msg 1
+         log_failure_msg "ERROR: Could not stop VM '$VM'"
+         RETVAL=2
+         continue
+         ;;
+      esac
+      
+      rm -f $VM_PIDFILE
+   }
+   
+   if [ -n "$1" ]
+	then
+		for VM in $VM_LIST
+		do
+			if [ "$VM" = "$1" ]
+			then
+				VM_EXISTS=1
+			fi
+		done
+		
+		if [ "$VM_EXISTS" -eq "$TRUE" ]
+		then
+			stop_vm $1	
+		else
+			log_failure_msg "VM $1 is not a registered VM"
+			echo "Enter the VM name from the list of running VMS below;"
+			
+			for VM_1 in $VM_LIST
+			do
+				echo "$VM_1"
+			done
+			
+			exit 1
+		fi
+		
+		VM_EXISTS=0
+		return
+	fi
+   
+   for VM in $VM_LIST
+   do
+      stop_vm $VM
+   done
+   
+   if [ "$RETVAL" -lt 2 ]
+   then
+      log_daemon_msg "VirtualBox daemon stopped successfully"
+   else
+      log_daemon_msg "VirtualBox daemon stopped with errors"
+   fi
+   
+   return "$RETVAL"
+}
+
+#
+# Function that sends a SIGHUP to the daemon/service
+#
+do_reload() {
+   #
+   # If the daemon can reload its configuration without
+   # restarting (for example, when it is sent a SIGHUP),
+   # then implement that here.
+   #
+   start-stop-daemon --stop --signal 1 --quiet --pidfile $PIDFILE --name $NAME
+   return 0
+}
+
+check_battery() 
+{
+	BATTERY_OK=true
+	BATTERY_LEVEL=0
+	
+	BATTERY_LEVEL=`acpi | awk '{print $4}' | tr -d "%,"`
+
+	if [ $BATTERY_LEVEL -le $BATTERY_THRESHOLD ]
+	then
+		echo "Low Battery! Halting any running VMs" | wall
+		do_stop
+		BATTERY_OK=false
+		log_warning_msg "Battery is critically low: $BATTERY_LEVEL%"
+	fi
+	
+
+	#########################################################################
+	#while [ $BATTERY_OK ]
+	#do
+	#	BATTERY_LEVEL=`acpi | awk '{print $4}' | tr -d "%,"`
+    #		#sleep 5
+    #
+	#	if [ $BATTERY_LEVEL -le $BATTERY_THRESHOLD ]
+	#	then
+	#		echo "Low Battery! Halting any running VMs" | wall
+	#		do_stop
+	#		BATTERY_OK=false
+	#		log_warning_msg "Battery is critically low: $BATTERY_LEVEL%"
+	#	fi
+	#done
+	###########################################################################
+}
+
+case "$1" in
+  start)
+   log_daemon_msg "Starting $DESC" "$NAME"
+   do_start $2
+   case "$?" in
+      0|1) log_end_msg 0 ;;
+      2) log_end_msg 1 ;;
+   esac
+   ;;
+  stop)
+   log_daemon_msg "Stopping $DESC" "$NAME"
+   do_stop $2
+   case "$?" in
+      0|1) log_end_msg 0 ;;
+      2) log_end_msg 1 ;;
+   esac
+   ;;
+  status)
+  	  if [ "$2" = "battery" ]
+  	  then
+  	  	  check_battery
+  	  	  exit 0
+  	  fi
+  	  
+	vm_init_list 1
+	
+	####################################################################
+	#if [ "$VM_LIST" = ""  ]
+	#then
+	#	echo "There are no running VMs!!!"
+	#else
+	#	echo "Running VMs:"
+	#
+	#	for VM in $VM_LIST
+	#	do
+	#		echo "-$VM"
+	#	done
+	#fi
+	####################################################################
+
+	RVM_LIST=$VM_LIST
+	Status="Not Running"
+	RUNNING="Running"
+	NOT_RUNNING="Not"
+
+	vm_init_list 0
+	#RMV_LIST=$VM_LIST
+	echo "\n***Battery status************"
+	echo `acpi`
+	echo "\n***VM status***********"
+	for VM in $VM_LIST
+	do
+		case $RVM_LIST in 
+		"$VM" )
+			Status="Running"
+		;;
+
+		esac
+		message=`printf "%s %s \t%s %15.20s" "Name:" $VM "Status:" $Status`
+		echo $message
+		#Status=`printf "%s %s" $NOT_RUNNING " " $RUNNING`
+		Status=`printf "%s %s" "Not:" $RUNNING`
+	done
+
+       #status_of_proc "$DAEMON" "$NAME" && exit 0 || exit $?
+       ;;
+  #reload|force-reload)
+   #
+   # If do_reload() is not implemented then leave this commented out
+   # and leave 'force-reload' as an alias for 'restart'.
+   #
+   #log_daemon_msg "Reloading $DESC" "$NAME"
+   #do_reload
+   #log_end_msg $?
+   #;;
+  restart|force-reload)
+   #
+   # If the "reload" option is implemented then remove the
+   # 'force-reload' alias
+   #
+   log_daemon_msg "Restarting $DESC" "$NAME"
+   do_stop
+   case "$?" in
+     0|1)
+      do_start $2
+      case "$?" in
+         0) log_end_msg 0 ;;
+         1) log_end_msg 1 ;; # Old process is still running
+         *) log_end_msg 1 ;; # Failed to start
+      esac
+      ;;
+     *)
+        # Failed to stop
+      log_end_msg 1
+      ;;
+   esac
+   ;;
+  *)
+   
+   echo "Usage: $SCRIPTNAME {start [VM]|stop [VM]|status|restart [VM]|force-reload [VM]}" >&2
+   echo "\t Please note that 'start' [VM] indicates that the argument VM is optional f.g. you can write start OMRS"
+   exit 3
+   ;;
+esac
+exit 0
+:
+
